@@ -1,6 +1,6 @@
 const core = require('@actions/core');
 const {
-  WAFv2Client,
+  WAFV2Client,
   UpdateIPSetCommand,
   GetIPSetCommand,
 } = require('@aws-sdk/client-wafv2');
@@ -12,7 +12,7 @@ const {
 /**
  * Configure AWS client
  * @param {string} region AWS region
- * @returns {WAFv2Client} Configured WAF client
+ * @returns {WAFV2Client} Configured WAF client
  */
 function createWAFClient(region) {
   // Use AWS SDK default credential chain
@@ -20,7 +20,7 @@ function createWAFClient(region) {
   // - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
   // - IAM roles (for self-hosted runners)
   // - Credentials set by actions like aws-actions/configure-aws-credentials
-  return new WAFv2Client({ region });
+  return new WAFV2Client({ region });
 }
 
 /**
@@ -35,7 +35,7 @@ function createEC2Client(region) {
 
 /**
  * Remove IP address from WAF IPSet with locking mechanism
- * @param {WAFv2Client} client WAF client
+ * @param {WAFV2Client} client WAF client
  * @param {string} id IPSet ID
  * @param {string} name IPSet name
  * @param {string} scope IPSet scope
@@ -89,6 +89,12 @@ async function removeIPFromIPSet(client, id, name, scope, ipAddress) {
       return;
     } catch (error) {
       if (error.name === 'WAFOptimisticLockException') {
+        if (attempt === maxRetries - 1) {
+          core.warning(
+            `Failed to cleanup IP after ${maxRetries} attempts due to lock conflicts. Manual cleanup may be required.`,
+          );
+          return;
+        }
         const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 1000;
         core.warning(
           `Lock conflict detected during cleanup, retrying in ${delay}ms... (attempt ${attempt + 1}/${maxRetries})`,
@@ -118,10 +124,21 @@ async function removeIPFromIPSet(client, id, name, scope, ipAddress) {
  * @param {string} groupId Security Group ID
  * @param {string} ipAddress IP address to remove
  * @param {string} description Description for the rule
+ * @param {number} port Ingress port (default: 443)
+ * @param {string} protocol Ingress protocol (default: 'tcp')
  */
-async function removeIPFromSecurityGroup(client, groupId, ipAddress, description) {
+async function removeIPFromSecurityGroup(
+  client,
+  groupId,
+  ipAddress,
+  description,
+  port = 443,
+  protocol = 'tcp',
+) {
   const maxRetries = 5;
   const baseDelay = 1000; // 1 second
+
+  const resolvedProtocol = protocol.toLowerCase() === 'all' ? '-1' : protocol;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
@@ -129,21 +146,25 @@ async function removeIPFromSecurityGroup(client, groupId, ipAddress, description
         `Cleanup attempt ${attempt + 1}: Removing IP ${ipAddress} from Security Group ${groupId}...`,
       );
 
-      const command = new RevokeSecurityGroupIngressCommand({
-        GroupId: groupId,
-        IpPermissions: [
+      const ipPermission = {
+        IpProtocol: resolvedProtocol,
+        IpRanges: [
           {
-            IpProtocol: 'tcp',
-            FromPort: 443,
-            ToPort: 443,
-            IpRanges: [
-              {
-                CidrIp: ipAddress,
-                Description: description || 'Temporary access from GitHub Actions runner',
-              },
-            ],
+            CidrIp: ipAddress,
+            Description:
+              description || 'Temporary access from GitHub Actions runner',
           },
         ],
+      };
+
+      if (resolvedProtocol !== '-1') {
+        ipPermission.FromPort = port;
+        ipPermission.ToPort = port;
+      }
+
+      const command = new RevokeSecurityGroupIngressCommand({
+        GroupId: groupId,
+        IpPermissions: [ipPermission],
       });
 
       await client.send(command);
@@ -161,9 +182,7 @@ async function removeIPFromSecurityGroup(client, groupId, ipAddress, description
       }
 
       // Log cleanup errors but don't fail the action
-      core.warning(
-        `Cleanup attempt ${attempt + 1} failed: ${error.message}`,
-      );
+      core.warning(`Cleanup attempt ${attempt + 1} failed: ${error.message}`);
       if (attempt === maxRetries - 1) {
         core.warning(
           `Failed to cleanup IP from Security Group after ${maxRetries} attempts. Manual cleanup may be required.`,
@@ -191,8 +210,11 @@ async function cleanup() {
     const sgGroupId = core.getState('sg-group-id');
     const sgDescription = core.getState('sg-description');
     const sgAwsRegion = core.getState('sg-aws-region');
+    const sgPort = parseInt(core.getState('sg-port') || '443', 10);
+    const sgProtocol = core.getState('sg-protocol') || 'tcp';
 
-    const hasWafState = runnerIP && ipsetId && ipsetName && ipsetScope && awsRegion;
+    const hasWafState =
+      runnerIP && ipsetId && ipsetName && ipsetScope && awsRegion;
     const hasSecurityGroupState = sgRunnerIP && sgGroupId && sgAwsRegion;
 
     if (!hasWafState && !hasSecurityGroupState) {
@@ -230,6 +252,8 @@ async function cleanup() {
         sgGroupId,
         sgRunnerIP,
         sgDescription,
+        sgPort,
+        sgProtocol,
       );
 
       core.info('Security Group cleanup completed successfully');

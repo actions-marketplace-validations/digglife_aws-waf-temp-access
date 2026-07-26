@@ -1,6 +1,6 @@
 const core = require('@actions/core');
 const {
-  WAFv2Client,
+  WAFV2Client,
   UpdateIPSetCommand,
   GetIPSetCommand,
 } = require('@aws-sdk/client-wafv2');
@@ -9,6 +9,15 @@ const {
   AuthorizeSecurityGroupIngressCommand,
 } = require('@aws-sdk/client-ec2');
 const axios = require('axios');
+
+/**
+ * Sleep for a specified number of milliseconds
+ * @param {number} ms Milliseconds to sleep
+ * @returns {Promise<void>}
+ */
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * Get the public IP address of the current GitHub runner
@@ -30,7 +39,9 @@ async function getPublicIP() {
       });
       return response.data.trim();
     } catch (fallbackError) {
-      throw new Error(`Failed to get public IP: ${fallbackError.message}`);
+      throw new Error(`Failed to get public IP: ${fallbackError.message}`, {
+        cause: fallbackError,
+      });
     }
   }
 }
@@ -38,7 +49,7 @@ async function getPublicIP() {
 /**
  * Configure AWS client
  * @param {string} region AWS region
- * @returns {WAFv2Client} Configured WAF client
+ * @returns {WAFV2Client} Configured WAF client
  */
 function createWAFClient(region) {
   // Use AWS SDK default credential chain
@@ -46,7 +57,7 @@ function createWAFClient(region) {
   // - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
   // - IAM roles (for self-hosted runners)
   // - Credentials set by actions like aws-actions/configure-aws-credentials
-  return new WAFv2Client({ region });
+  return new WAFV2Client({ region });
 }
 
 /**
@@ -61,11 +72,12 @@ function createEC2Client(region) {
 
 /**
  * Add IP address to WAF IPSet with locking mechanism
- * @param {WAFv2Client} client WAF client
+ * @param {WAFV2Client} client WAF client
  * @param {string} id IPSet ID
  * @param {string} name IPSet name
  * @param {string} scope IPSet scope
  * @param {string} ipAddress IP address to add
+ * @returns {Promise<boolean>} Returns true if IPSet was updated, false if IP was already present
  */
 async function addIPToIPSet(client, id, name, scope, ipAddress) {
   const maxRetries = 10;
@@ -91,7 +103,7 @@ async function addIPToIPSet(client, id, name, scope, ipAddress) {
         : `${ipAddress}/32`;
       if (currentAddresses.includes(ipWithCidr)) {
         core.info(`IP ${ipWithCidr} is already in the IPSet`);
-        return;
+        return false;
       }
 
       // Add the new IP to the list
@@ -116,9 +128,9 @@ async function addIPToIPSet(client, id, name, scope, ipAddress) {
       core.saveState('ipset-id', id);
       core.saveState('ipset-name', name);
       core.saveState('ipset-scope', scope);
-      core.saveState('aws-region', client.config.region);
+      core.saveState('aws-region', await client.config.region());
 
-      return;
+      return true;
     } catch (error) {
       if (error.name === 'WAFOptimisticLockException') {
         const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 1000;
@@ -143,32 +155,46 @@ async function addIPToIPSet(client, id, name, scope, ipAddress) {
  * @param {string} groupId Security Group ID
  * @param {string} ipAddress IP address to add
  * @param {string} description Description for the rule
+ * @param {number} port Ingress port (default: 443)
+ * @param {string} protocol Ingress protocol (default: 'tcp')
  */
-async function addIPToSecurityGroup(client, groupId, ipAddress, description) {
+async function addIPToSecurityGroup(
+  client,
+  groupId,
+  ipAddress,
+  description,
+  port = 443,
+  protocol = 'tcp',
+) {
   const maxRetries = 5;
   const baseDelay = 1000; // 1 second
 
   const ipWithCidr = ipAddress.includes('/') ? ipAddress : `${ipAddress}/32`;
+  const resolvedProtocol = protocol.toLowerCase() === 'all' ? '-1' : protocol;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       core.info(`Adding IP ${ipWithCidr} to Security Group ${groupId}...`);
 
-      const command = new AuthorizeSecurityGroupIngressCommand({
-        GroupId: groupId,
-        IpPermissions: [
+      const ipPermission = {
+        IpProtocol: resolvedProtocol,
+        IpRanges: [
           {
-            IpProtocol: 'tcp',
-            FromPort: 443,
-            ToPort: 443,
-            IpRanges: [
-              {
-                CidrIp: ipWithCidr,
-                Description: description || 'Temporary access from GitHub Actions runner',
-              },
-            ],
+            CidrIp: ipWithCidr,
+            Description:
+              description || 'Temporary access from GitHub Actions runner',
           },
         ],
+      };
+
+      if (resolvedProtocol !== '-1') {
+        ipPermission.FromPort = port;
+        ipPermission.ToPort = port;
+      }
+
+      const command = new AuthorizeSecurityGroupIngressCommand({
+        GroupId: groupId,
+        IpPermissions: [ipPermission],
       });
 
       await client.send(command);
@@ -179,13 +205,20 @@ async function addIPToSecurityGroup(client, groupId, ipAddress, description) {
       // Store the information for cleanup
       core.saveState('sg-runner-ip', ipWithCidr);
       core.saveState('sg-group-id', groupId);
-      core.saveState('sg-description', description || 'Temporary access from GitHub Actions runner');
-      core.saveState('sg-aws-region', client.config.region);
+      core.saveState(
+        'sg-description',
+        description || 'Temporary access from GitHub Actions runner',
+      );
+      core.saveState('sg-aws-region', await client.config.region());
+      core.saveState('sg-port', port.toString());
+      core.saveState('sg-protocol', protocol);
 
       return;
     } catch (error) {
       if (error.name === 'InvalidPermission.Duplicate') {
-        core.info(`IP ${ipWithCidr} is already allowed in Security Group ${groupId}`);
+        core.info(
+          `IP ${ipWithCidr} is already allowed in Security Group ${groupId}`,
+        );
         return;
       }
 
@@ -208,9 +241,21 @@ async function main() {
     const id = core.getInput('id');
     const name = core.getInput('name');
     const scope = core.getInput('scope');
-    const region = core.getInput('region', { required: true });
+    const region =
+      core.getInput('region') ||
+      process.env.AWS_REGION ||
+      process.env.AWS_DEFAULT_REGION ||
+      'us-east-1';
     const securityGroupId = core.getInput('security-group-id');
-    const securityGroupDescription = core.getInput('security-group-description');
+    const securityGroupDescription = core.getInput(
+      'security-group-description',
+    );
+    const securityGroupPort = parseInt(
+      core.getInput('security-group-port') || '443',
+      10,
+    );
+    const securityGroupProtocol =
+      core.getInput('security-group-protocol') || 'tcp';
 
     // Validate that at least one target is specified
     const hasWafConfig = id && name;
@@ -227,7 +272,9 @@ async function main() {
       core.info(`WAF IPSet target: ${name} (${id})`);
     }
     if (hasSecurityGroupConfig) {
-      core.info(`Security Group target: ${securityGroupId}`);
+      core.info(
+        `Security Group target: ${securityGroupId} (Port: ${securityGroupPort}, Protocol: ${securityGroupProtocol})`,
+      );
     }
 
     // Validate WAF scope if WAF is configured
@@ -243,9 +290,17 @@ async function main() {
     core.info(`Public IP detected: ${publicIP}`);
 
     // Handle WAF IPSet if configured
+    let ipSetUpdated = false;
     if (hasWafConfig) {
       const wafClient = createWAFClient(region);
-      await addIPToIPSet(wafClient, id, name, scope, publicIP);
+      ipSetUpdated = await addIPToIPSet(wafClient, id, name, scope, publicIP);
+
+      // Wait for WAF IPSet propagation if an update occurred
+      if (ipSetUpdated) {
+        core.info('Waiting 30 seconds for WAF IPSet changes to propagate...');
+        await sleep(30000);
+        core.info('WAF IPSet propagation wait completed');
+      }
     }
 
     // Handle Security Group if configured
@@ -256,13 +311,15 @@ async function main() {
         securityGroupId,
         publicIP,
         securityGroupDescription,
+        securityGroupPort,
+        securityGroupProtocol,
       );
     }
 
     core.setOutput('ip-address', publicIP);
     core.setOutput('status', 'success');
   } catch (error) {
-    core.setFailed(`Action failed: ${error.message}`);
+    core.setFailed(`Action failed: ${error.message}:${error.stack}`);
     core.debug(error.stack);
   }
 }
@@ -274,6 +331,7 @@ if (require.main === module) {
 
 // Export functions for testing
 module.exports = {
+  sleep,
   getPublicIP,
   createWAFClient,
   createEC2Client,
